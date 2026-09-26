@@ -1122,11 +1122,51 @@ async def sweep_to_hot_wallet(chain, iso, address):
         logger.info(f"sweep_to_hot_wallet failed: {e}")
 
 
+def _evm_chains_for_iso(iso):
+    """EVM chains where this ISO is either the native coin or a known token."""
+    chains = []
+    for ch, (sub, nid, native, cid) in rec_mod.EVM.items():
+        if iso == native or iso in rec_mod.TOKENS.get(ch, {}):
+            chains.append(ch)
+    return chains
+
+
+async def _credit_direct_deposit(a, iso, chain, nid, onchain):
+    """Credit the delta of a detected on-chain deposit (per address+iso+chain) and sweep."""
+    address = a["address"]
+    seen = await db.addr_credits.find_one({"address": address, "iso": iso, "chain": chain})
+    last = float(seen.get("balance", 0.0)) if seen else 0.0
+    if onchain > last + 1e-9:
+        delta = round(onchain - last, 8)
+        plat = await get_platform_settings()
+        plat_fee = deposit_fee_for(plat, iso)
+        net_amount = max(0.0, round(delta - plat_fee, 8))
+        fee_applied = round(delta - net_amount, 8)
+        await credit_balance(a["user_id"], iso, net_amount)
+        if fee_applied > 0:
+            await add_to_pool(iso, fee_applied, network_id=nid)
+        net_name = NETWORKS.get(nid, {}).get("name", chain)
+        await add_transaction(
+            a["user_id"], "deposit", iso, nid, net_amount, status="Done",
+            address=address, txid="onchain",
+            description=f"Deposit {iso} · {net_name} (gross {delta} {iso}, fee {fee_applied} {iso})",
+            fee=fee_applied, fee_iso=iso, gross_amount=delta, source="cabinet")
+        await db.addr_credits.update_one(
+            {"address": address, "iso": iso, "chain": chain},
+            {"$set": {"balance": onchain, "updated_ts": now_ts()}}, upsert=True)
+        logger.info(f"direct deposit credited: {net_amount} {iso} on {chain} @ {address}")
+        asyncio.create_task(sweep_to_hot_wallet(chain, iso, address))
+    elif onchain < last:
+        await db.addr_credits.update_one(
+            {"address": address, "iso": iso, "chain": chain},
+            {"$set": {"balance": onchain, "updated_ts": now_ts()}}, upsert=True)
+
+
 async def direct_deposit_worker():
     """LIVE detection for CABINET deposits made straight to a wallet address (no invoice).
     Credits balance + writes history, then sweeps funds to the hot wallet.
-    Bug fix: previously only invoice payments were detected, so direct deposits never
-    updated the balance nor appeared in transaction history."""
+    EVM addresses are identical across ETH/BSC/Polygon/Arbitrum, so we detect the deposit
+    on ALL EVM chains (a user who chose ERC-20 but paid on BEP-20 is still credited)."""
     await asyncio.sleep(12)
     while True:
         try:
@@ -1135,47 +1175,29 @@ async def direct_deposit_worker():
             for a in addrs:
                 chain = a.get("chain")
                 iso = a.get("iso")
-                nid = a.get("network_id")
                 address = a.get("address")
                 if not (chain and iso and address):
                     continue
                 if chain in rec_mod.EVM:
-                    onchain = await asyncio.to_thread(rec_mod.check_evm_deposit, address, chain, iso)
+                    # scan the SAME 0x address across every EVM chain for this currency
+                    for ch in _evm_chains_for_iso(iso):
+                        try:
+                            onchain = await asyncio.to_thread(rec_mod.check_evm_deposit, address, ch, iso)
+                        except Exception:
+                            onchain = 0.0
+                        await _credit_direct_deposit(a, iso, ch, rec_mod.EVM[ch][1], float(onchain or 0))
                 elif chain == "tron":
                     onchain = await asyncio.to_thread(rec_mod.check_tron_deposit, address, iso)
+                    await _credit_direct_deposit(a, iso, "tron", 2, float(onchain or 0))
                 elif chain == "bitcoin":
                     onchain = await asyncio.to_thread(rec_mod.check_btc_deposit, address)
-                else:
-                    continue
-                onchain = float(onchain or 0)
-                seen = await db.addr_credits.find_one({"address": address, "iso": iso})
-                last = float(seen.get("balance", 0.0)) if seen else 0.0
-                if onchain > last + 1e-9:
-                    delta = round(onchain - last, 8)
-                    plat = await get_platform_settings()
-                    plat_fee = deposit_fee_for(plat, iso)
-                    net_amount = max(0.0, round(delta - plat_fee, 8))
-                    fee_applied = round(delta - net_amount, 8)
-                    await credit_balance(a["user_id"], iso, net_amount)
-                    if fee_applied > 0:
-                        await add_to_pool(iso, fee_applied, network_id=nid)
-                    await add_transaction(
-                        a["user_id"], "deposit", iso, nid, net_amount, status="Done",
-                        address=address, txid="onchain",
-                        description=f"Deposit {iso} (gross {delta} {iso}, fee {fee_applied} {iso})",
-                        fee=fee_applied, fee_iso=iso, gross_amount=delta, source="cabinet")
-                    await db.addr_credits.update_one(
-                        {"address": address, "iso": iso},
-                        {"$set": {"balance": onchain, "updated_ts": now_ts()}}, upsert=True)
-                    asyncio.create_task(sweep_to_hot_wallet(chain, iso, address))
-                elif onchain < last:
-                    # funds were swept out — reset baseline so the next deposit is detected
-                    await db.addr_credits.update_one(
-                        {"address": address, "iso": iso},
-                        {"$set": {"balance": onchain, "updated_ts": now_ts()}}, upsert=True)
+                    await _credit_direct_deposit(a, iso, "bitcoin", 0, float(onchain or 0))
         except Exception as e:
             logger.info(f"direct_deposit_worker error: {e}")
         await asyncio.sleep(25)
+
+
+
 
 
 async def withdrawal_worker():
